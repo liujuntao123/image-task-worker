@@ -57,6 +57,7 @@ interface ImageTaskRow {
   started_at: string | null;
   completed_at: string | null;
   failed_at: string | null;
+  deleted_at: string | null;
   updated_at: string;
 }
 
@@ -64,6 +65,13 @@ interface StoredImageObject {
   key: string;
   contentType: string;
   size: number;
+}
+
+interface DeletedTaskCleanupTarget {
+  taskId: string;
+  uuid: string;
+  resultObjects: string | null;
+  deletedAt: string;
 }
 
 interface NormalizedImage {
@@ -78,8 +86,8 @@ const JSON_HEADERS = {
 const MAX_TARGET_PAYLOAD_BYTES = 256 * 1024;
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    return handleRequest(request, env);
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return handleRequest(request, env, ctx);
   },
 
   async queue(batch: MessageBatch<ImageTaskMessage>, env: Env): Promise<void> {
@@ -89,7 +97,7 @@ export default {
   }
 };
 
-async function handleRequest(request: Request, env: Env): Promise<Response> {
+async function handleRequest(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
 
   if (request.method === "OPTIONS") {
@@ -117,6 +125,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const detailMatch = url.pathname.match(/^\/tasks\/([^/]+)$/);
     if (request.method === "GET" && detailMatch) {
       return getTaskDetail(detailMatch[1], url, env);
+    }
+
+    if (request.method === "DELETE" && detailMatch) {
+      return deleteTask(detailMatch[1], url, env, ctx);
     }
 
     return json({ error: "not_found" }, 404);
@@ -198,6 +210,7 @@ async function listTasks(url: URL, env: Env): Promise<Response> {
   const countResult = await env.DB.prepare(`
     SELECT COUNT(*) AS count FROM image_tasks
     WHERE uuid IN (${placeholders})
+      AND deleted_at IS NULL
   `)
     .bind(...uuids)
     .first<{ count: number }>();
@@ -205,6 +218,7 @@ async function listTasks(url: URL, env: Env): Promise<Response> {
   const result = await env.DB.prepare(`
     SELECT * FROM image_tasks
     WHERE uuid IN (${placeholders})
+      AND deleted_at IS NULL
     ORDER BY created_at DESC
     LIMIT ? OFFSET ?
   `)
@@ -224,7 +238,7 @@ async function listTasks(url: URL, env: Env): Promise<Response> {
 
 async function getTaskDetail(taskId: string, url: URL, env: Env): Promise<Response> {
   const row = await selectTask(taskId, env);
-  if (!row || !matchesUuidFilter(row, url)) {
+  if (!row || row.deleted_at || !matchesUuidFilter(row, url)) {
     return json({ error: "task_not_found" }, 404);
   }
 
@@ -233,7 +247,7 @@ async function getTaskDetail(taskId: string, url: URL, env: Env): Promise<Respon
 
 async function getTaskImage(taskId: string, imageIndex: number, url: URL, env: Env): Promise<Response> {
   const row = await selectTask(taskId, env);
-  if (!row || !matchesUuidFilter(row, url)) {
+  if (!row || row.deleted_at || !matchesUuidFilter(row, url)) {
     return json({ error: "task_not_found" }, 404);
   }
 
@@ -257,6 +271,46 @@ async function getTaskImage(taskId: string, imageIndex: number, url: URL, env: E
   return withCors(new Response(r2Object.body, { headers }));
 }
 
+async function deleteTask(taskId: string, url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const uuids = parseUuidQuery(url);
+  if (uuids.length === 0) {
+    return json({ error: "uuid_required" }, 400);
+  }
+
+  const deletedAt = new Date().toISOString();
+  const placeholders = uuids.map(() => "?").join(", ");
+  const deleted = await env.DB.prepare(`
+    UPDATE image_tasks
+    SET target_api_key = NULL,
+        target_payload = NULL,
+        result_objects = NULL,
+        result_urls = NULL,
+        deleted_at = ?,
+        updated_at = ?
+    WHERE id = ?
+      AND deleted_at IS NULL
+      AND uuid IN (${placeholders})
+    RETURNING id AS taskId, uuid, result_objects AS resultObjects, deleted_at AS deletedAt
+  `)
+    .bind(deletedAt, deletedAt, taskId, ...uuids)
+    .first<DeletedTaskCleanupTarget>();
+
+  if (!deleted) {
+    return json({ error: "task_not_found" }, 404);
+  }
+
+  ctx.waitUntil(cleanupDeletedTaskObjects(deleted, env));
+
+  logTaskEvent("image_task_deleted", {
+    taskId,
+    uuid: deleted.uuid,
+    deletedAt,
+    cleanupMode: cleanupModeFor(deleted)
+  });
+
+  return json({ deleted: true, taskId, deletedAt });
+}
+
 async function handleQueueMessage(message: Message<ImageTaskMessage>, env: Env): Promise<void> {
   const taskId = message.body?.taskId;
   if (!taskId) {
@@ -265,10 +319,10 @@ async function handleQueueMessage(message: Message<ImageTaskMessage>, env: Env):
   }
 
   const task = await selectTask(taskId, env);
-  if (!task || task.status === "succeeded" || task.status === "failed") {
+  if (!task || task.deleted_at || task.status === "succeeded" || task.status === "failed") {
     logTaskEvent("image_task_skip", {
       taskId,
-      reason: !task ? "not_found" : `already_${task.status}`
+      reason: !task ? "not_found" : task.deleted_at ? "deleted" : `already_${task.status}`
     });
     message.ack();
     return;
@@ -291,7 +345,7 @@ async function handleQueueMessage(message: Message<ImageTaskMessage>, env: Env):
     startedAt: now
   });
 
-  await env.DB.prepare(`
+  const runningUpdate = await env.DB.prepare(`
     UPDATE image_tasks
     SET status = 'running',
         attempts = ?,
@@ -299,17 +353,41 @@ async function handleQueueMessage(message: Message<ImageTaskMessage>, env: Env):
         updated_at = ?,
         error = NULL
     WHERE id = ?
+      AND deleted_at IS NULL
   `)
     .bind(attempt, now, now, taskId)
     .run();
 
+  if ((runningUpdate.meta.changes ?? 0) === 0) {
+    logTaskEvent("image_task_skip", {
+      taskId,
+      uuid: task.uuid,
+      reason: "deleted_before_start",
+      attempt
+    });
+    message.ack();
+    return;
+  }
+
   try {
     const images = await callTargetImageApi(task, env);
+    const beforeStore = await selectTask(taskId, env);
+    if (!beforeStore || beforeStore.deleted_at) {
+      logTaskEvent("image_task_skip_store", {
+        taskId,
+        uuid: task.uuid,
+        reason: !beforeStore ? "not_found" : "deleted",
+        durationMs: Date.now() - startedAtMs
+      });
+      message.ack();
+      return;
+    }
+
     const storedObjects = await storeImages(task, images, env);
     const resultUrls = resultUrlsFor(task, storedObjects, env);
     const completedAt = new Date().toISOString();
 
-    await env.DB.prepare(`
+    const updateResult = await env.DB.prepare(`
       UPDATE image_tasks
       SET status = 'succeeded',
           target_api_key = NULL,
@@ -319,9 +397,22 @@ async function handleQueueMessage(message: Message<ImageTaskMessage>, env: Env):
           updated_at = ?,
           error = NULL
       WHERE id = ?
+        AND deleted_at IS NULL
     `)
       .bind(JSON.stringify(storedObjects), JSON.stringify(resultUrls), completedAt, completedAt, taskId)
       .run();
+
+    if ((updateResult.meta.changes ?? 0) === 0) {
+      await deleteStoredObjects(storedObjects, env);
+      logTaskEvent("image_task_cleanup_after_delete", {
+        taskId,
+        uuid: task.uuid,
+        cleanedObjects: storedObjects.length,
+        durationMs: Date.now() - startedAtMs
+      });
+      message.ack();
+      return;
+    }
 
     logTaskEvent("image_task_success", {
       taskId,
@@ -355,6 +446,7 @@ async function handleQueueMessage(message: Message<ImageTaskMessage>, env: Env):
             queued_at = ?,
             updated_at = ?
         WHERE id = ?
+          AND deleted_at IS NULL
       `)
         .bind(errorText, queuedAt, queuedAt, taskId)
         .run();
@@ -384,6 +476,7 @@ async function handleQueueMessage(message: Message<ImageTaskMessage>, env: Env):
           failed_at = ?,
           updated_at = ?
       WHERE id = ?
+        AND deleted_at IS NULL
     `)
       .bind(errorText, failedAt, failedAt, taskId)
       .run();
@@ -699,8 +792,62 @@ function serializeTask(row: ImageTaskRow) {
     startedAt: row.started_at,
     completedAt: row.completed_at,
     failedAt: row.failed_at,
+    deletedAt: row.deleted_at,
     updatedAt: row.updated_at
   };
+}
+
+async function deleteStoredObjects(objects: StoredImageObject[], env: Env): Promise<number> {
+  if (objects.length === 0) return 0;
+  await env.IMAGES.delete(objects.map((object) => object.key));
+  return objects.length;
+}
+
+async function cleanupDeletedTaskObjects(target: DeletedTaskCleanupTarget, env: Env): Promise<void> {
+  const objects = parseJsonArray<StoredImageObject>(target.resultObjects);
+  try {
+    const deletedObjects =
+      objects.length > 0
+        ? await deleteStoredObjects(objects, env)
+        : await deleteStoredObjectsByTaskPrefix(target.uuid, target.taskId, env);
+
+    logTaskEvent("image_task_deleted_objects_cleaned", {
+      taskId: target.taskId,
+      uuid: target.uuid,
+      deletedObjects,
+      cleanupMode: cleanupModeFor(target)
+    });
+  } catch (error) {
+    logTaskEvent("image_task_deleted_objects_cleanup_error", {
+      taskId: target.taskId,
+      uuid: target.uuid,
+      deletedObjects: objects.length,
+      cleanupMode: cleanupModeFor(target),
+      error: truncate(errorMessage(error), 1000)
+    });
+  }
+}
+
+async function deleteStoredObjectsByTaskPrefix(uuid: string, taskId: string, env: Env): Promise<number> {
+  const prefix = `tasks/${uuid}/${taskId}/`;
+  let cursor: string | undefined;
+  let deletedCount = 0;
+
+  do {
+    const listed = await env.IMAGES.list({ prefix, cursor });
+    const keys = listed.objects.map((object) => object.key);
+    if (keys.length > 0) {
+      await env.IMAGES.delete(keys);
+      deletedCount += keys.length;
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+
+  return deletedCount;
+}
+
+function cleanupModeFor(target: DeletedTaskCleanupTarget): "stored_objects" | "prefix_scan" {
+  return target.resultObjects ? "stored_objects" : "prefix_scan";
 }
 
 function parseJsonArray<T>(value: string | null): T[] {
@@ -735,7 +882,7 @@ function json(body: unknown, status = 200): Response {
 function withCors(response: Response): Response {
   const headers = new Headers(response.headers);
   headers.set("Access-Control-Allow-Origin", "*");
-  headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  headers.set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
   headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
   return new Response(response.body, {
     status: response.status,
