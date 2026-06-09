@@ -1,0 +1,32 @@
+name = "image-task-worker"
+main = "src/index.ts"
+compatibility_date = "2026-06-08"
+
+[vars]
+MAX_ATTEMPTS = "3"
+DEFAULT_IMAGE_TIMEOUT_SECONDS = "600"
+IMAGE_DOWNLOAD_TIMEOUT_SECONDS = "120"
+# Set this if the R2 bucket is publicly served through a custom domain.
+# When empty, task results still include R2 object keys and can be fetched
+# through GET /tasks/:taskId/images/:index.
+R2_PUBLIC_BASE_URL = ""
+
+[[d1_databases]]
+binding = "DB"
+database_name = "image-task-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "image-task-results"
+
+[[queues.producers]]
+binding = "IMAGE_TASK_QUEUE"
+queue = "image-task-queue"
+
+[[queues.consumers]]
+queue = "image-task-queue"
+max_batch_size = 1
+max_batch_timeout = 5
+max_retries = 10
+dead_letter_queue = "image-task-dlq"
