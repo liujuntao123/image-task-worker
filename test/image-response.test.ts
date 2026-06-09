@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import worker, { extractImageReferences, parseImageApiResponse, targetRequestBodyForTask } from "../src/index";
+import worker, { extractImageReferences, parseImageApiResponse, targetRequestBodyForTask, targetRequestForTask } from "../src/index";
 
 describe("extractImageReferences", () => {
   it("extracts OpenAI-compatible image URLs", () => {
@@ -122,6 +122,50 @@ describe("targetRequestBodyForTask", () => {
   });
 });
 
+describe("targetRequestForTask", () => {
+  it("builds a multipart images edit request when stored input images are present", async () => {
+    const r2 = createMockR2Bucket({
+      objects: {
+        "tasks/device-1/task-1/inputs/0.png": new Uint8Array([1, 2, 3])
+      }
+    });
+    const task = createTaskRow({
+      target_url: "https://api.example/v1/images/generations",
+      target_payload: JSON.stringify({
+        model: "gpt-image-2",
+        prompt: "make it brighter",
+        size: "1024x1024",
+        quality: "auto",
+        __inputImages: [
+          {
+            key: "tasks/device-1/task-1/inputs/0.png",
+            contentType: "image/png",
+            size: 3,
+            filename: "reference.png"
+          }
+        ]
+      })
+    });
+
+    const request = await targetRequestForTask(task, {
+      DB: createMockDb(task),
+      IMAGES: r2,
+      IMAGE_TASK_QUEUE: createMockQueue()
+    });
+
+    expect(request.url).toBe("https://api.example/v1/images/edits");
+    expect(request.headers.get("Authorization")).toBe("Bearer sk-test");
+    expect(request.headers.has("Content-Type")).toBe(false);
+    expect(request.body).toBeInstanceOf(FormData);
+
+    const formData = request.body as FormData;
+    expect(formData.get("model")).toBe("gpt-image-2");
+    expect(formData.get("prompt")).toBe("make it brighter");
+    expect(formData.getAll("image[]")).toHaveLength(1);
+    expect(formData.get("image[]")).toBeInstanceOf(File);
+  });
+});
+
 describe("DELETE /tasks/:taskId", () => {
   it("requires a uuid filter", async () => {
     const response = await worker.fetch(new Request("https://worker.example/tasks/task-1", { method: "DELETE" }), {
@@ -170,6 +214,7 @@ describe("DELETE /tasks/:taskId", () => {
     r2.resolveDelete();
     await ctx.runWaitUntil();
     expect(r2.deletedKeys).toEqual(["tasks/device-1/task-1/0.png", "tasks/device-1/task-1/1.webp"]);
+    expect(r2.listedPrefixes).toEqual(["tasks/device-1/task-1/"]);
   });
 
   it("can clean up task objects by prefix without storing result objects in the delete response path", async () => {
@@ -337,17 +382,34 @@ function createMockDb(row: MockTaskRow | null): D1Database {
   } as unknown as D1Database;
 }
 
-function createMockR2Bucket(options: { deferDelete?: boolean; listedKeys?: string[] } = {}): R2Bucket & {
+function createMockR2Bucket(options: { deferDelete?: boolean; listedKeys?: string[]; objects?: Record<string, Uint8Array> } = {}): R2Bucket & {
   deletedKeys: string[];
   listedPrefixes: string[];
+  putObjects: string[];
   resolveDelete: () => void;
 } {
   const deletedKeys: string[] = [];
   const listedPrefixes: string[] = [];
+  const putObjects: string[] = [];
   let resolveDelete: () => void = () => undefined;
   return {
     deletedKeys,
     listedPrefixes,
+    putObjects,
+    async get(key: string) {
+      const bytes = options.objects?.[key];
+      if (!bytes) return null;
+      const copy = new Uint8Array(bytes);
+      return new Response(new Blob([copy.buffer], { type: "image/png" }), {
+        headers: {
+          "Content-Type": "image/png"
+        }
+      });
+    },
+    async put(key: string) {
+      putObjects.push(key);
+      return;
+    },
     async delete(keys: string | string[]) {
       if (options.deferDelete) {
         await new Promise<void>((resolve) => {
@@ -368,7 +430,7 @@ function createMockR2Bucket(options: { deferDelete?: boolean; listedKeys?: strin
     resolveDelete() {
       resolveDelete();
     }
-  } as unknown as R2Bucket & { deletedKeys: string[]; listedPrefixes: string[]; resolveDelete: () => void };
+  } as unknown as R2Bucket & { deletedKeys: string[]; listedPrefixes: string[]; putObjects: string[]; resolveDelete: () => void };
 }
 
 function createMockQueue(): Queue<{ taskId: string }> {

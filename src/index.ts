@@ -23,6 +23,7 @@ interface CreateTaskRequest {
   modelId?: string;
   prompt?: string;
   payload?: unknown;
+  inputImages?: unknown;
   uuid?: string;
   maxAttempts?: number;
 }
@@ -33,6 +34,7 @@ interface NormalizedCreateTaskRequest {
   modelId: string;
   prompt: string;
   targetPayload: string;
+  inputImages: NormalizedInputImage[];
   uuid: string;
   maxAttempts: number;
 }
@@ -71,6 +73,7 @@ interface DeletedTaskCleanupTarget {
   taskId: string;
   uuid: string;
   resultObjects: string | null;
+  targetPayload: string | null;
   deletedAt: string;
 }
 
@@ -79,11 +82,26 @@ interface NormalizedImage {
   contentType: string;
 }
 
+interface NormalizedInputImage {
+  bytes: Uint8Array;
+  contentType: string;
+  filename: string;
+}
+
+interface StoredInputImageObject {
+  key: string;
+  contentType: string;
+  size: number;
+  filename: string;
+}
+
 const JSON_HEADERS = {
   "Content-Type": "application/json; charset=utf-8"
 };
 
 const MAX_TARGET_PAYLOAD_BYTES = 256 * 1024;
+const MAX_INPUT_IMAGES = 16;
+const MAX_INPUT_IMAGE_BYTES = 50 * 1024 * 1024;
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -145,6 +163,8 @@ async function createTask(request: Request, env: Env): Promise<Response> {
   const payload = validateCreateTask(await readJson<CreateTaskRequest>(request), env);
   const taskId = crypto.randomUUID();
   const now = new Date().toISOString();
+  const inputObjects = await storeInputImages(taskId, payload.uuid, payload.inputImages, env);
+  const targetPayload = buildStoredTargetPayload(payload.targetPayload, inputObjects);
 
   await env.DB.prepare(`
     INSERT INTO image_tasks (
@@ -160,7 +180,7 @@ async function createTask(request: Request, env: Env): Promise<Response> {
       keyHint(payload.apiKey),
       payload.modelId,
       payload.prompt,
-      payload.targetPayload,
+      targetPayload,
       payload.maxAttempts,
       now,
       now,
@@ -290,7 +310,7 @@ async function deleteTask(taskId: string, url: URL, env: Env, ctx: ExecutionCont
     WHERE id = ?
       AND deleted_at IS NULL
       AND uuid IN (${placeholders})
-    RETURNING id AS taskId, uuid, result_objects AS resultObjects, deleted_at AS deletedAt
+    RETURNING id AS taskId, uuid, result_objects AS resultObjects, target_payload AS targetPayload, deleted_at AS deletedAt
   `)
     .bind(deletedAt, deletedAt, taskId, ...uuids)
     .first<DeletedTaskCleanupTarget>();
@@ -501,16 +521,14 @@ async function callTargetImageApi(task: ImageTaskRow, env: Env): Promise<Normali
     throw new Error("target_api_key_missing");
   }
 
+  const request = await targetRequestForTask(task, env);
   const timeoutMs = parseBoundedInteger(env.DEFAULT_IMAGE_TIMEOUT_SECONDS, 600, 10, 900) * 1000;
   const response = await fetchWithTimeout(
-    task.target_url,
+    request.url,
     {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${task.target_api_key}`,
-        "Content-Type": "application/json"
-      },
-      body: targetRequestBodyForTask(task)
+      headers: request.headers,
+      body: request.body
     },
     timeoutMs
   );
@@ -523,8 +541,53 @@ async function callTargetImageApi(task: ImageTaskRow, env: Env): Promise<Normali
   return parseImageApiResponse(response, env);
 }
 
+export async function targetRequestForTask(
+  task: Pick<ImageTaskRow, "target_payload" | "target_api_key" | "target_url" | "model_id" | "prompt">,
+  env: Env
+): Promise<{ url: string; headers: Headers; body: BodyInit }> {
+  const headers = new Headers({
+    Authorization: `Bearer ${task.target_api_key ?? ""}`
+  });
+  const payload = parseJsonObject(task.target_payload) ?? { model: task.model_id, prompt: task.prompt };
+  const inputObjects = parseStoredInputImageObjects(payload.__inputImages);
+
+  if (inputObjects.length === 0) {
+    headers.set("Content-Type", "application/json");
+    return {
+      url: task.target_url,
+      headers,
+      body: targetRequestBodyForTask(task)
+    };
+  }
+
+  const formData = new FormData();
+  for (const [key, value] of Object.entries(payload)) {
+    if (key === "__inputImages" || value === undefined || value === null) continue;
+    appendFormValue(formData, key, value);
+  }
+
+  for (const [index, object] of inputObjects.entries()) {
+    const image = await env.IMAGES.get(object.key);
+    if (!image) {
+      throw new Error(`input_image_missing:${object.key}`);
+    }
+    const contentType = normalizeImageContentType(object.contentType);
+    const blob = new Blob([await image.arrayBuffer()], { type: contentType });
+    formData.append("image[]", blob, object.filename || `input-${index + 1}.${extensionForContentType(contentType)}`);
+  }
+
+  return {
+    url: editUrlFor(task.target_url),
+    headers,
+    body: formData
+  };
+}
+
 export function targetRequestBodyForTask(task: Pick<ImageTaskRow, "target_payload" | "model_id" | "prompt">): string {
-  return task.target_payload || JSON.stringify({ model: task.model_id, prompt: task.prompt });
+  const payload = parseJsonObject(task.target_payload);
+  if (!payload) return JSON.stringify({ model: task.model_id, prompt: task.prompt });
+  delete payload.__inputImages;
+  return JSON.stringify(payload);
 }
 
 export async function parseImageApiResponse(response: Response, env?: Env): Promise<NormalizedImage[]> {
@@ -602,20 +665,24 @@ async function imageFromReference(ref: string, env?: Env): Promise<NormalizedIma
   }
 
   if (ref.startsWith("data:")) {
-    const match = ref.match(/^data:([^;,]+)?;base64,(.+)$/);
-    if (!match) {
-      throw new Error("invalid_data_url_image");
-    }
-
-    return {
-      bytes: base64ToBytes(match[2]),
-      contentType: normalizeImageContentType(match[1] ?? "image/png")
-    };
+    return imageFromDataUrl(ref);
   }
 
   return {
     bytes: base64ToBytes(ref),
     contentType: "image/png"
+  };
+}
+
+function imageFromDataUrl(value: string): NormalizedImage {
+  const match = value.match(/^data:([^;,]+)?;base64,(.+)$/);
+  if (!match) {
+    throw new HttpError(400, "invalid_data_url_image");
+  }
+
+  return {
+    bytes: base64ToBytes(match[2]),
+    contentType: normalizeImageContentType(match[1] ?? "image/png")
   };
 }
 
@@ -646,6 +713,49 @@ async function storeImages(task: ImageTaskRow, images: NormalizedImage[], env: E
   return stored;
 }
 
+async function storeInputImages(
+  taskId: string,
+  uuid: string,
+  images: NormalizedInputImage[],
+  env: Env
+): Promise<StoredInputImageObject[]> {
+  const stored: StoredInputImageObject[] = [];
+
+  for (const [index, image] of images.entries()) {
+    const extension = extensionForContentType(image.contentType);
+    const key = `tasks/${uuid}/${taskId}/inputs/${index}.${extension}`;
+    await env.IMAGES.put(key, image.bytes, {
+      httpMetadata: {
+        contentType: image.contentType
+      },
+      customMetadata: {
+        taskId,
+        uuid,
+        source: "input"
+      }
+    });
+
+    stored.push({
+      key,
+      contentType: image.contentType,
+      size: image.bytes.byteLength,
+      filename: image.filename || `input-${index + 1}.${extension}`
+    });
+  }
+
+  return stored;
+}
+
+function buildStoredTargetPayload(targetPayload: string, inputObjects: StoredInputImageObject[]): string {
+  if (inputObjects.length === 0) return targetPayload;
+  const payload = parseJsonObject(targetPayload);
+  if (!payload) return targetPayload;
+  return stringifyTargetPayload({
+    ...payload,
+    __inputImages: inputObjects
+  });
+}
+
 function resultUrlsFor(task: ImageTaskRow, objects: StoredImageObject[], env: Env): string[] {
   const publicBaseUrl = (env.R2_PUBLIC_BASE_URL ?? "").replace(/\/+$/, "");
   if (publicBaseUrl) {
@@ -663,6 +773,7 @@ function validateCreateTask(input: CreateTaskRequest, env: Env): NormalizedCreat
   const targetUrl = stringField(input.targetUrl ?? input.url, "url", 2048);
   const apiKey = stringField(input.apiKey ?? input.key, "key", 4096);
   const explicitPayload = normalizeTargetPayload(input.payload);
+  const inputImages = normalizeInputImages(input.inputImages);
   const modelId =
     optionalStringField(input.modelId ?? input.modelid, 256) ??
     optionalStringField(explicitPayload?.model, 256) ??
@@ -695,6 +806,7 @@ function validateCreateTask(input: CreateTaskRequest, env: Env): NormalizedCreat
     modelId,
     prompt,
     targetPayload,
+    inputImages,
     uuid,
     maxAttempts
   };
@@ -710,6 +822,37 @@ function normalizeTargetPayload(value: unknown): Record<string, unknown> | null 
   }
 
   return value as Record<string, unknown>;
+}
+
+function normalizeInputImages(value: unknown): NormalizedInputImage[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new HttpError(400, "input_images_array_required");
+  }
+  if (value.length > MAX_INPUT_IMAGES) {
+    throw new HttpError(400, "too_many_input_images");
+  }
+
+  return value.map((item, index) => normalizeInputImage(item, index));
+}
+
+function normalizeInputImage(value: unknown, index: number): NormalizedInputImage {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpError(400, "input_image_object_required");
+  }
+
+  const record = value as Record<string, unknown>;
+  const dataUrl = stringField(record.dataUrl, "input_image_data_url", MAX_INPUT_IMAGE_BYTES * 2);
+  const image = imageFromDataUrl(dataUrl);
+  if (image.bytes.byteLength > MAX_INPUT_IMAGE_BYTES) {
+    throw new HttpError(400, "input_image_too_large");
+  }
+
+  const fallbackName = `input-${index + 1}.${extensionForContentType(image.contentType)}`;
+  return {
+    ...image,
+    filename: optionalStringField(record.filename, 160) ?? fallbackName
+  };
 }
 
 function stringifyTargetPayload(payload: Record<string, unknown>): string {
@@ -804,12 +947,20 @@ async function deleteStoredObjects(objects: StoredImageObject[], env: Env): Prom
 }
 
 async function cleanupDeletedTaskObjects(target: DeletedTaskCleanupTarget, env: Env): Promise<void> {
-  const objects = parseJsonArray<StoredImageObject>(target.resultObjects);
+  const outputObjects = parseJsonArray<StoredImageObject>(target.resultObjects);
+  const inputObjects = parseStoredInputImageObjects(parseJsonObject(target.targetPayload)?.__inputImages);
+  const objects = [
+    ...outputObjects,
+    ...inputObjects.map((object) => ({
+      key: object.key,
+      contentType: object.contentType,
+      size: object.size
+    }))
+  ];
   try {
-    const deletedObjects =
-      objects.length > 0
-        ? await deleteStoredObjects(objects, env)
-        : await deleteStoredObjectsByTaskPrefix(target.uuid, target.taskId, env);
+    const deletedKnownObjects = objects.length > 0 ? await deleteStoredObjects(objects, env) : 0;
+    const deletedPrefixObjects = await deleteStoredObjectsByTaskPrefix(target.uuid, target.taskId, env);
+    const deletedObjects = deletedKnownObjects + deletedPrefixObjects;
 
     logTaskEvent("image_task_deleted_objects_cleaned", {
       taskId: target.taskId,
@@ -868,6 +1019,39 @@ function parseJsonObject(value: string | null): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+function parseStoredInputImageObjects(value: unknown): StoredInputImageObject[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const record = item as Record<string, unknown>;
+    if (typeof record.key !== "string" || typeof record.contentType !== "string") return [];
+    return [
+      {
+        key: record.key,
+        contentType: record.contentType,
+        size: typeof record.size === "number" ? record.size : 0,
+        filename: typeof record.filename === "string" ? record.filename : "input.png"
+      }
+    ];
+  });
+}
+
+function appendFormValue(formData: FormData, key: string, value: unknown): void {
+  if (Array.isArray(value)) {
+    for (const item of value) appendFormValue(formData, key, item);
+    return;
+  }
+  if (typeof value === "object") {
+    formData.append(key, JSON.stringify(value));
+    return;
+  }
+  formData.append(key, String(value));
+}
+
+function editUrlFor(targetUrl: string): string {
+  return targetUrl.replace(/\/images\/generations(\?.*)?$/i, "/images/edits$1");
 }
 
 function json(body: unknown, status = 200): Response {
