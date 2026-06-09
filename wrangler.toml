@@ -14,7 +14,7 @@ R2_PUBLIC_BASE_URL = ""
 [[d1_databases]]
 binding = "DB"
 database_name = "image-task-db"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "208e61a7-65c5-4546-9549-695d9ad54d2c"
 
 [[r2_buckets]]
 binding = "IMAGES"
