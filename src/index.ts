@@ -22,6 +22,7 @@ interface CreateTaskRequest {
   apiKey?: string;
   modelId?: string;
   prompt?: string;
+  payload?: unknown;
   uuid?: string;
   maxAttempts?: number;
 }
@@ -31,6 +32,7 @@ interface NormalizedCreateTaskRequest {
   apiKey: string;
   modelId: string;
   prompt: string;
+  targetPayload: string;
   uuid: string;
   maxAttempts: number;
 }
@@ -44,6 +46,7 @@ interface ImageTaskRow {
   api_key_hint: string | null;
   model_id: string;
   prompt: string;
+  target_payload: string | null;
   result_objects: string | null;
   result_urls: string | null;
   error: string | null;
@@ -71,6 +74,8 @@ interface NormalizedImage {
 const JSON_HEADERS = {
   "Content-Type": "application/json; charset=utf-8"
 };
+
+const MAX_TARGET_PAYLOAD_BYTES = 256 * 1024;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -132,8 +137,8 @@ async function createTask(request: Request, env: Env): Promise<Response> {
   await env.DB.prepare(`
     INSERT INTO image_tasks (
       id, uuid, status, target_url, target_api_key, api_key_hint, model_id,
-      prompt, attempts, max_attempts, created_at, queued_at, updated_at
-    ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+      prompt, target_payload, attempts, max_attempts, created_at, queued_at, updated_at
+    ) VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
   `)
     .bind(
       taskId,
@@ -143,6 +148,7 @@ async function createTask(request: Request, env: Env): Promise<Response> {
       keyHint(payload.apiKey),
       payload.modelId,
       payload.prompt,
+      payload.targetPayload,
       payload.maxAttempts,
       now,
       now,
@@ -260,12 +266,30 @@ async function handleQueueMessage(message: Message<ImageTaskMessage>, env: Env):
 
   const task = await selectTask(taskId, env);
   if (!task || task.status === "succeeded" || task.status === "failed") {
+    logTaskEvent("image_task_skip", {
+      taskId,
+      reason: !task ? "not_found" : `already_${task.status}`
+    });
     message.ack();
     return;
   }
 
   const attempt = task.attempts + 1;
   const now = new Date().toISOString();
+  const startedAtMs = Date.now();
+  logTaskEvent("image_task_start", {
+    taskId,
+    uuid: task.uuid,
+    status: task.status,
+    attempt,
+    maxAttempts: task.max_attempts,
+    targetUrl: task.target_url,
+    modelId: task.model_id,
+    promptLength: task.prompt.length,
+    targetPayloadBytes: byteLength(task.target_payload ?? ""),
+    queuedAt: task.queued_at,
+    startedAt: now
+  });
 
   await env.DB.prepare(`
     UPDATE image_tasks
@@ -299,6 +323,23 @@ async function handleQueueMessage(message: Message<ImageTaskMessage>, env: Env):
       .bind(JSON.stringify(storedObjects), JSON.stringify(resultUrls), completedAt, completedAt, taskId)
       .run();
 
+    logTaskEvent("image_task_success", {
+      taskId,
+      uuid: task.uuid,
+      attempt,
+      maxAttempts: task.max_attempts,
+      imageCount: storedObjects.length,
+      resultBytes: storedObjects.reduce((sum, object) => sum + object.size, 0),
+      resultObjects: storedObjects.map((object) => ({
+        key: object.key,
+        contentType: object.contentType,
+        size: object.size
+      })),
+      startedAt: now,
+      completedAt,
+      durationMs: Date.now() - startedAtMs
+    });
+
     message.ack();
   } catch (error) {
     const latest = await selectTask(taskId, env);
@@ -318,6 +359,18 @@ async function handleQueueMessage(message: Message<ImageTaskMessage>, env: Env):
         .bind(errorText, queuedAt, queuedAt, taskId)
         .run();
 
+      logTaskEvent("image_task_retry", {
+        taskId,
+        uuid: task.uuid,
+        attempt,
+        maxAttempts,
+        error: errorText,
+        startedAt: now,
+        queuedAt,
+        durationMs: Date.now() - startedAtMs,
+        delaySeconds: retryDelaySeconds(attempt)
+      });
+
       message.retry({ delaySeconds: retryDelaySeconds(attempt) });
       return;
     }
@@ -334,6 +387,17 @@ async function handleQueueMessage(message: Message<ImageTaskMessage>, env: Env):
     `)
       .bind(errorText, failedAt, failedAt, taskId)
       .run();
+
+    logTaskEvent("image_task_failure", {
+      taskId,
+      uuid: task.uuid,
+      attempt,
+      maxAttempts,
+      error: errorText,
+      startedAt: now,
+      failedAt,
+      durationMs: Date.now() - startedAtMs
+    });
 
     message.ack();
   }
@@ -353,10 +417,7 @@ async function callTargetImageApi(task: ImageTaskRow, env: Env): Promise<Normali
         "Authorization": `Bearer ${task.target_api_key}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        model: task.model_id,
-        prompt: task.prompt
-      })
+      body: targetRequestBodyForTask(task)
     },
     timeoutMs
   );
@@ -367,6 +428,10 @@ async function callTargetImageApi(task: ImageTaskRow, env: Env): Promise<Normali
   }
 
   return parseImageApiResponse(response, env);
+}
+
+export function targetRequestBodyForTask(task: Pick<ImageTaskRow, "target_payload" | "model_id" | "prompt">): string {
+  return task.target_payload || JSON.stringify({ model: task.model_id, prompt: task.prompt });
 }
 
 export async function parseImageApiResponse(response: Response, env?: Env): Promise<NormalizedImage[]> {
@@ -504,8 +569,16 @@ async function selectTask(taskId: string, env: Env): Promise<ImageTaskRow | null
 function validateCreateTask(input: CreateTaskRequest, env: Env): NormalizedCreateTaskRequest {
   const targetUrl = stringField(input.targetUrl ?? input.url, "url", 2048);
   const apiKey = stringField(input.apiKey ?? input.key, "key", 4096);
-  const modelId = stringField(input.modelId ?? input.modelid, "modelid", 256);
-  const prompt = stringField(input.prompt, "prompt", 20000);
+  const explicitPayload = normalizeTargetPayload(input.payload);
+  const modelId =
+    optionalStringField(input.modelId ?? input.modelid, 256) ??
+    optionalStringField(explicitPayload?.model, 256) ??
+    (explicitPayload ? "" : stringField(undefined, "modelid", 256));
+  const prompt =
+    optionalStringField(input.prompt, 20000) ??
+    optionalStringField(explicitPayload?.prompt, 20000) ??
+    (explicitPayload ? "" : stringField(undefined, "prompt", 20000));
+  const targetPayload = stringifyTargetPayload(explicitPayload ?? { model: modelId, prompt });
   const uuid = stringField(input.uuid, "uuid", 128);
   const maxAttempts = parseBoundedInteger(
     input.maxAttempts === undefined ? env.MAX_ATTEMPTS : String(input.maxAttempts),
@@ -528,9 +601,30 @@ function validateCreateTask(input: CreateTaskRequest, env: Env): NormalizedCreat
     apiKey,
     modelId,
     prompt,
+    targetPayload,
     uuid,
     maxAttempts
   };
+}
+
+function normalizeTargetPayload(value: unknown): Record<string, unknown> | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpError(400, "payload_object_required");
+  }
+
+  return value as Record<string, unknown>;
+}
+
+function stringifyTargetPayload(payload: Record<string, unknown>): string {
+  const jsonPayload = JSON.stringify(payload);
+  if (byteLength(jsonPayload) > MAX_TARGET_PAYLOAD_BYTES) {
+    throw new HttpError(400, "payload_too_large");
+  }
+  return jsonPayload;
 }
 
 function stringField(value: unknown, name: string, maxLength: number): string {
@@ -541,6 +635,23 @@ function stringField(value: unknown, name: string, maxLength: number): string {
   const trimmed = value.trim();
   if (trimmed.length > maxLength) {
     throw new HttpError(400, `${name}_too_long`);
+  }
+
+  return trimmed;
+}
+
+function optionalStringField(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  if (trimmed.length > maxLength) {
+    throw new HttpError(400, "field_too_long");
   }
 
   return trimmed;
@@ -577,6 +688,7 @@ function serializeTask(row: ImageTaskRow) {
     apiKeyHint: row.api_key_hint,
     modelId: row.model_id,
     prompt: row.prompt,
+    targetPayload: parseJsonObject(row.target_payload),
     resultObjects: parseJsonArray<StoredImageObject>(row.result_objects),
     resultUrls: parseJsonArray<string>(row.result_urls),
     error: row.error,
@@ -598,6 +710,16 @@ function parseJsonArray<T>(value: string | null): T[] {
     return Array.isArray(parsed) ? (parsed as T[]) : [];
   } catch {
     return [];
+  }
+}
+
+function parseJsonObject(value: string | null): Record<string, unknown> | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
   }
 }
 
@@ -691,8 +813,22 @@ function retryDelaySeconds(attempt: number): number {
   return Math.min(60 * 2 ** Math.max(0, attempt - 1), 300);
 }
 
+function logTaskEvent(event: string, details: Record<string, unknown>): void {
+  console.log(
+    JSON.stringify({
+      event,
+      timestamp: new Date().toISOString(),
+      ...details
+    })
+  );
+}
+
 function truncate(value: string, maxLength: number): string {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength)}...`;
+}
+
+function byteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 function errorMessage(error: unknown): string {

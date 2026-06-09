@@ -26,7 +26,7 @@ queue = "image-task-queue"
 
 [[queues.consumers]]
 queue = "image-task-queue"
-max_batch_size = 1
+max_batch_size = 5
 max_batch_timeout = 5
 max_retries = 10
 dead_letter_queue = "image-task-dlq"

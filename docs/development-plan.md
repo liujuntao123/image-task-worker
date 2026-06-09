@@ -2,7 +2,7 @@
 
 ## 我对需求的完整理解
 
-目标是用 Cloudflare 的 D1、R2 和 Worker 做一套异步图像生成任务接口。用户创建任务时传入目标生图 API 的 `url`、`key`、`modelid`、`prompt`，以及一个用于后续批量查询的 `UUID`。创建接口不能同步等待 1-10 分钟，而是先把任务写入 D1，再把任务投递给 Cloudflare 的长时异步执行机制。异步任务调用目标生图 API，等待图片返回；成功则把图片写入 R2、把结果写回 D1；失败则按策略自动重试，超过上限后把失败状态和原因写回 D1。
+目标是用 Cloudflare 的 D1、R2 和 Worker 做一套异步图像生成任务接口。用户创建任务时传入目标生图 API 的 `url`、`key`、请求 `payload`，以及一个用于后续批量查询的 `UUID`。创建接口不能同步等待 1-10 分钟，而是先把任务写入 D1，再把任务投递给 Cloudflare 的长时异步执行机制。异步任务调用目标生图 API，等待图片返回；成功则把图片写入 R2、把结果写回 D1；失败则按策略自动重试，超过上限后把失败状态和原因写回 D1。
 
 Cloudflare 上适合这个场景的机制是 **Cloudflare Queues**。HTTP Worker 作为 producer 创建任务并发消息，Queue consumer 在后台处理任务。Queues consumer 的 wall-clock 时间可以覆盖慢图像 API 的 1-10 分钟等待窗口。
 
@@ -31,14 +31,17 @@ Cloudflare 上适合这个场景的机制是 **Cloudflare Queues**。HTTP Worker
 {
   "url": "https://api.example.com/v1/images/generations",
   "key": "sk-...",
-  "modelid": "image-model",
-  "prompt": "A clean product render",
+  "payload": {
+    "model": "gpt-image-1",
+    "prompt": "A clean product render",
+    "size": "1024x1024"
+  },
   "uuid": "client-or-user-uuid",
   "maxAttempts": 3
 }
 ```
 
-接口也兼容 `targetUrl`、`apiKey`、`modelId` 这组三个别名，方便工程代码使用更清晰的字段。
+接口也兼容 `targetUrl`、`apiKey`、`modelId` 这组三个别名，方便工程代码使用更清晰的字段。没有传 `payload` 时，会兼容旧逻辑，用 `modelid/modelId` 和 `prompt` 组装 `{ "model": "...", "prompt": "..." }`。
 
 响应：
 
@@ -76,8 +79,8 @@ Cloudflare 上适合这个场景的机制是 **Cloudflare Queues**。HTTP Worker
 3. 发送 `{ taskId }` 到 Cloudflare Queue。
 4. Queue consumer 收到消息后读取 D1；如果任务已结束则 ack。
 5. 更新状态为 `running`，`attempts + 1`。
-6. POST 调用目标生图 API：`Authorization: Bearer key`，body 为 `{ model, prompt }`。
-7. 解析目标响应，兼容 `image/*`、OpenAI 风格 `data[].url`、`data[].b64_json`、data URL 和常见 `images` 字段。
+6. POST 调用目标生图 API：`Authorization: Bearer key`，body 优先使用创建任务时保存的 `payload`。
+7. 解析目标响应，推荐 OpenAI Images 风格 `data[].b64_json`，同时兼容 `data[].url`、`image/*`、data URL 和常见 `images` 字段。
 8. 下载或解码图片，写入 R2。
 9. 成功：D1 更新为 `succeeded`，写入 R2 key/URL，清空 `target_api_key`，ack 队列消息。
 10. 失败且未到重试上限：D1 回到 `queued`，记录错误，`message.retry({ delaySeconds })`。

@@ -102,8 +102,11 @@ curl -X POST "$WORKER_URL/tasks" \
   -d '{
     "url": "https://api.example.com/v1/images/generations",
     "key": "sk-...",
-    "modelid": "image-model",
-    "prompt": "A clean product render",
+    "payload": {
+      "model": "gpt-image-1",
+      "prompt": "A clean product render",
+      "size": "1024x1024"
+    },
     "uuid": "test-user-001",
     "maxAttempts": 3
   }'
@@ -201,6 +204,20 @@ npx wrangler tail image-task-worker
 ```
 
 重点看 Queue 是否创建、consumer 是否绑定、目标 API 是否超时或报错。
+
+队列 consumer 会输出结构化 JSON 日志，事件包括：
+
+- `image_task_start`：任务开始，含 `taskId`、`uuid`、`attempt`、`targetUrl`、`modelId`、`startedAt`。
+- `image_task_success`：任务成功，含 `completedAt`、`durationMs`、`imageCount`、R2 对象 key 和大小。
+- `image_task_retry`：任务将重试，含错误、耗时和延迟秒数。
+- `image_task_failure`：任务最终失败，含 `failedAt`、`durationMs` 和错误。
+- `image_task_skip`：任务已结束或不存在时跳过。
+
+查看实时日志：
+
+```bash
+npx wrangler tail image-task-worker
+```
 
 ### 任务 failed
 

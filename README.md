@@ -12,9 +12,9 @@ For practical follow-up development and deployment steps, see [docs/deploy-and-d
 - `GET /tasks/:taskId/images/:index`: stream a stored R2 result image when the bucket is not public.
 - `GET /health`: lightweight health check.
 
-The create endpoint accepts either the product field names (`url`, `key`, `modelid`) or the clearer aliases (`targetUrl`, `apiKey`, `modelId`).
+The create endpoint accepts either the product field names (`url`, `key`, `modelid`) or the clearer aliases (`targetUrl`, `apiKey`, `modelId`). It also accepts a `payload` object. When `payload` is present, the Queue consumer stores it with the task and posts it to the target image API as-is.
 
-The Queue consumer calls the target image API with:
+Without `payload`, the Queue consumer keeps the previous default body:
 
 ```json
 {
@@ -23,11 +23,11 @@ The Queue consumer calls the target image API with:
 }
 ```
 
-and `Authorization: Bearer API_KEY`. It supports direct `image/*` responses, OpenAI-compatible `{ "data": [{ "url": "..." }] }`, `{ "data": [{ "b64_json": "..." }] }`, data URLs, and a few common `images` / `image_url` response shapes.
+and `Authorization: Bearer API_KEY`. The recommended target response shape is the OpenAI Images format, especially `{ "data": [{ "b64_json": "..." }] }`; `{ "data": [{ "url": "..." }] }` is also supported. Direct `image/*` responses, data URLs, and a few common `images` / `image_url` response shapes remain compatible.
 
 ## Data flow
 
-1. Client creates a task with `targetUrl`, `apiKey`, `modelId`, `prompt`, and `uuid`.
+1. Client creates a task with `targetUrl`, `apiKey`, `uuid`, and a target API `payload`.
 2. Worker inserts a `queued` row in D1. The API key is stored temporarily because the async consumer needs it.
 3. Worker sends `{ taskId }` to `IMAGE_TASK_QUEUE`.
 4. Queue consumer loads the task, marks it `running`, and calls the target API. Cloudflare Queues consumers can run long enough for slow image APIs, so this is the long-running worker path.
@@ -74,8 +74,11 @@ curl -X POST "$WORKER_URL/tasks" \
   -d '{
     "url": "https://api.example.com/v1/images/generations",
     "key": "sk-...",
-    "modelid": "image-model",
-    "prompt": "A clean product render",
+    "payload": {
+      "model": "gpt-image-1",
+      "prompt": "A clean product render",
+      "size": "1024x1024"
+    },
     "uuid": "user-or-client-uuid",
     "maxAttempts": 3
   }'
@@ -106,3 +109,4 @@ curl "$WORKER_URL/tasks/TASK_ID/images/0?uuid=user-or-client-uuid" --output resu
 - `DEFAULT_IMAGE_TIMEOUT_SECONDS` defaults to `600`, matching a 10-minute target API wait.
 - `IMAGE_DOWNLOAD_TIMEOUT_SECONDS` defaults to `120`, so image URL downloads cannot hang the whole consumer indefinitely.
 - `MAX_ATTEMPTS` defaults to `3`; per-task `maxAttempts` can lower or raise this up to `10`.
+- Queue processing writes structured JSON logs for task start, success, retry, failure, and skipped messages. Use `npx wrangler tail image-task-worker` to inspect live task timing and result metadata.
