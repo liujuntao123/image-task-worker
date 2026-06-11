@@ -1,159 +1,24 @@
 import { sha3_512 } from "js-sha3";
-import { verifyToken } from "@clerk/backend";
-
-type TaskStatus = "queued" | "running" | "succeeded" | "failed";
-type ImageTaskSource = "target-api" | "chatgpt-web";
-type ChatGptAccountStatus = "active" | "inactive" | "invalid" | "rate_limited";
-
-export interface Env {
-  DB: D1Database;
-  IMAGES: R2Bucket;
-  IMAGE_TASK_QUEUE: Queue<ImageTaskMessage>;
-  MAX_ATTEMPTS?: string;
-  DEFAULT_IMAGE_TIMEOUT_SECONDS?: string;
-  IMAGE_DOWNLOAD_TIMEOUT_SECONDS?: string;
-  CHATGPT_ACCESS_TOKEN?: string;
-  CHATGPT_BASE_URL?: string;
-  CHATGPT_CLIENT_VERSION?: string;
-  CHATGPT_CLIENT_BUILD_NUMBER?: string;
-  R2_PUBLIC_BASE_URL?: string;
-  CLERK_SECRET_KEY?: string;
-  CLERK_JWT_KEY?: string;
-  CLERK_AUTHORIZED_PARTIES?: string;
-  IMAGE_API_URL?: string;
-  IMAGE_API_KEY?: string;
-  IMAGE_API_MODEL?: string;
-  IMAGE_TASK_SOURCE?: string;
-}
-
-interface ImageTaskMessage {
-  taskId: string;
-}
-
-interface CreateTaskRequest {
-  url?: string;
-  key?: string;
-  modelid?: string;
-  targetUrl?: string;
-  apiKey?: string;
-  modelId?: string;
-  prompt?: string;
-  payload?: unknown;
-  inputImages?: unknown;
-  mask?: unknown;
-  uuid?: string;
-  maxAttempts?: number;
-  source?: string;
-  accountId?: string;
-}
-
-interface AuthContext {
-  userId: string;
-}
-
-interface NormalizedCreateTaskRequest {
-  targetUrl: string;
-  apiKey: string | null;
-  accountId: string | null;
-  modelId: string;
-  prompt: string;
-  targetPayload: string;
-  inputImages: NormalizedInputImage[];
-  mask: NormalizedInputImage | null;
-  uuid: string;
-  maxAttempts: number;
-  source: ImageTaskSource;
-}
-
-interface ImageTaskRow {
-  id: string;
-  uuid: string;
-  status: TaskStatus;
-  target_url: string;
-  target_api_key: string | null;
-  api_key_hint: string | null;
-  account_id?: string | null;
-  model_id: string;
-  prompt: string;
-  target_payload: string | null;
-  result_objects: string | null;
-  result_urls: string | null;
-  error: string | null;
-  attempts: number;
-  max_attempts: number;
-  created_at: string;
-  queued_at: string;
-  started_at: string | null;
-  completed_at: string | null;
-  failed_at: string | null;
-  deleted_at: string | null;
-  updated_at: string;
-}
-
-interface ChatGptAccountRow {
-  id: string;
-  label: string;
-  email: string | null;
-  access_token: string;
-  token_hint: string;
-  status: ChatGptAccountStatus;
-  quota_remaining: number | null;
-  quota_limit: number | null;
-  last_checked_at: string | null;
-  last_used_at: string | null;
-  last_error: string | null;
-  total_uses: number;
-  success_count: number;
-  failure_count: number;
-  created_at: string;
-  updated_at: string;
-}
-
-interface AccountPoolListResult {
-  results?: ChatGptAccountRow[];
-}
-
-interface AccountPoolWriteRequest {
-  label?: unknown;
-  email?: unknown;
-  accessToken?: unknown;
-  token?: unknown;
-  status?: unknown;
-  quotaRemaining?: unknown;
-  quotaLimit?: unknown;
-}
-
-interface StoredImageObject {
-  key: string;
-  contentType: string;
-  size: number;
-}
-
-interface DeletedTaskCleanupTarget {
-  taskId: string;
-  uuid: string;
-  resultObjects: string | null;
-  targetPayload: string | null;
-  deletedAt: string;
-}
-
-interface NormalizedImage {
-  bytes: Uint8Array;
-  contentType: string;
-}
-
-interface NormalizedInputImage {
-  bytes: Uint8Array;
-  contentType: string;
-  filename: string;
-}
-
-interface StoredInputImageObject {
-  key: string;
-  contentType: string;
-  size: number;
-  filename: string;
-}
+import { AuthError, requireAuth } from "./auth";
+import type {
+  AccountPoolListResult,
+  AccountPoolWriteRequest,
+  AuthContext,
+  ChatGptAccountRow,
+  ChatGptAccountStatus,
+  DeletedTaskCleanupTarget,
+  CreateTaskRequest,
+  Env,
+  ImageTaskMessage,
+  ImageTaskRow,
+  ImageTaskSource,
+  NormalizedCreateTaskRequest,
+  NormalizedImage,
+  NormalizedInputImage,
+  StoredImageObject,
+  StoredInputImageObject
+} from "./types";
+export type { Env } from "./types";
 
 const JSON_HEADERS = {
   "Content-Type": "application/json; charset=utf-8"
@@ -254,53 +119,12 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 
     return json({ error: "not_found" }, 404);
   } catch (error) {
-    if (error instanceof HttpError) {
+    if (error instanceof HttpError || error instanceof AuthError) {
       return json({ error: error.message }, error.status);
     }
 
     return json({ error: "internal_error", message: errorMessage(error) }, 500);
   }
-}
-
-async function requireAuth(request: Request, env: Env): Promise<AuthContext> {
-  const token = bearerToken(request);
-  if (!token) {
-    throw new HttpError(401, "auth_required");
-  }
-
-  if (!env.CLERK_SECRET_KEY && !env.CLERK_JWT_KEY) {
-    throw new HttpError(500, "clerk_not_configured");
-  }
-
-  try {
-    const payload = await verifyToken(token, {
-      secretKey: env.CLERK_SECRET_KEY,
-      jwtKey: env.CLERK_JWT_KEY,
-      authorizedParties: csvEnv(env.CLERK_AUTHORIZED_PARTIES)
-    });
-    const userId = optionalStringField(payload.sub, 256);
-    if (!userId) {
-      throw new HttpError(401, "invalid_auth_token");
-    }
-    return { userId };
-  } catch (error) {
-    if (error instanceof HttpError) throw error;
-    throw new HttpError(401, "invalid_auth_token");
-  }
-}
-
-function bearerToken(request: Request): string | null {
-  const authorization = request.headers.get("Authorization") ?? "";
-  const match = authorization.match(/^Bearer\s+(.+)$/i);
-  return match?.[1]?.trim() || null;
-}
-
-function csvEnv(value: string | undefined): string[] | undefined {
-  const items = (value ?? "")
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-  return items.length > 0 ? items : undefined;
 }
 
 async function createTask(request: Request, env: Env, auth: AuthContext): Promise<Response> {

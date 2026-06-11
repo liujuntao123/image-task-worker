@@ -87,6 +87,23 @@ Deploy:
 npm run deploy
 ```
 
+## Project Structure
+
+- `src/index.ts`: Worker entrypoint, routing, task lifecycle, queue consumer, upstream adapters, and serializers.
+- `src/types.ts`: Worker bindings, request/row/domain types shared across modules and tests.
+- `src/auth.ts`: Clerk bearer-token verification and task auth context extraction.
+- `test/image-response.test.ts`: contract tests for task auth, source selection, image parsing, queue processing, and account APIs.
+- `migrations/`: append-only D1 schema migrations.
+- `docs/deploy-and-development.md`: operational setup, deploy, and troubleshooting guide.
+
+## Checks
+
+```bash
+npm run check
+```
+
+`check` runs TypeScript, Vitest, and a Wrangler dry-run deploy package check.
+
 ## Request examples
 
 Create:

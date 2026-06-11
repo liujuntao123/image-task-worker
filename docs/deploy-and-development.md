@@ -17,8 +17,7 @@ npm install
 常用检查：
 
 ```bash
-npm run typecheck
-npm test
+npm run check
 ```
 
 本地启动 Worker：
@@ -37,9 +36,7 @@ npm run dev
 每次改完至少跑：
 
 ```bash
-npm run typecheck
-npm test
-npx wrangler deploy --dry-run --outdir .wrangler-dry-run-check
+npm run check
 ```
 
 ## 2. 首次部署 Cloudflare 资源
