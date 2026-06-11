@@ -6,6 +6,12 @@ compatibility_date = "2026-06-08"
 MAX_ATTEMPTS = "3"
 DEFAULT_IMAGE_TIMEOUT_SECONDS = "600"
 IMAGE_DOWNLOAD_TIMEOUT_SECONDS = "120"
+IMAGE_TASK_SOURCE = "target-api"
+IMAGE_API_URL = "https://sub.aizhi.site/v1/images/generations"
+IMAGE_API_MODEL = "gpt-image-2"
+CHATGPT_BASE_URL = "https://chatgpt.com"
+CHATGPT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887"
+CHATGPT_CLIENT_BUILD_NUMBER = "6708908"
 # Set this if the R2 bucket is publicly served through a custom domain.
 # When empty, task results still include R2 object keys and can be fetched
 # through GET /tasks/:taskId/images/:index.
