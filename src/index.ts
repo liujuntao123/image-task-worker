@@ -1,5 +1,26 @@
 import { sha3_512 } from "js-sha3";
 import { AuthError, requireAuth } from "./auth";
+import {
+  byteLength,
+  ensureOk,
+  errorMessage,
+  fetchWithTimeout,
+  HttpError,
+  json,
+  parseBoundedInteger,
+  sleep,
+  truncate,
+  withCors
+} from "./core";
+import {
+  base64ToBytes,
+  bytesToBase64,
+  extensionForContentType,
+  imageFromDataUrl,
+  imageFromReference,
+  normalizeImageContentType,
+  parseImageApiResponse
+} from "./image-codecs";
 import type {
   AccountPoolListResult,
   AccountPoolWriteRequest,
@@ -19,10 +40,7 @@ import type {
   StoredInputImageObject
 } from "./types";
 export type { Env } from "./types";
-
-const JSON_HEADERS = {
-  "Content-Type": "application/json; charset=utf-8"
-};
+export { extractImageReferences, parseImageApiResponse } from "./image-codecs";
 
 const MAX_TARGET_PAYLOAD_BYTES = 256 * 1024;
 const MAX_INPUT_IMAGES = 16;
@@ -1338,102 +1356,6 @@ class ChatGptWebClient {
   }
 }
 
-export async function parseImageApiResponse(response: Response, env?: Env): Promise<NormalizedImage[]> {
-  const contentType = response.headers.get("content-type") ?? "";
-  if (contentType.toLowerCase().startsWith("image/")) {
-    return [
-      {
-        bytes: new Uint8Array(await response.arrayBuffer()),
-        contentType: normalizeImageContentType(contentType)
-      }
-    ];
-  }
-
-  const jsonBody = (await response.json()) as unknown;
-  const refs = extractImageReferences(jsonBody);
-  if (refs.length === 0) {
-    throw new Error("target_response_missing_image");
-  }
-
-  const images: NormalizedImage[] = [];
-  for (const ref of refs) {
-    images.push(await imageFromReference(ref, env));
-  }
-  return images;
-}
-
-export function extractImageReferences(value: unknown): string[] {
-  const refs: string[] = [];
-
-  if (typeof value === "string") {
-    if (looksLikeImageReference(value)) refs.push(value);
-    return refs;
-  }
-
-  if (!value || typeof value !== "object") {
-    return refs;
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) refs.push(...extractImageReferences(item));
-    return refs;
-  }
-
-  const record = value as Record<string, unknown>;
-  for (const key of ["b64_json", "url", "image_url", "image", "output"]) {
-    const candidate = record[key];
-    if (typeof candidate === "string" && looksLikeImageReference(candidate)) {
-      refs.push(candidate);
-    }
-  }
-
-  for (const key of ["data", "images", "output", "result"]) {
-    const nested = record[key];
-    if (nested && typeof nested === "object") {
-      refs.push(...extractImageReferences(nested));
-    }
-  }
-
-  return Array.from(new Set(refs));
-}
-
-async function imageFromReference(ref: string, env?: Env): Promise<NormalizedImage> {
-  if (ref.startsWith("http://") || ref.startsWith("https://")) {
-    const timeoutMs = parseBoundedInteger(env?.IMAGE_DOWNLOAD_TIMEOUT_SECONDS, 120, 10, 900) * 1000;
-    const imageResponse = await fetchWithTimeout(ref, {}, timeoutMs);
-    if (!imageResponse.ok) {
-      throw new Error(`image_download_error:${imageResponse.status}`);
-    }
-
-    const contentType = normalizeImageContentType(imageResponse.headers.get("content-type") ?? "");
-    return {
-      bytes: new Uint8Array(await imageResponse.arrayBuffer()),
-      contentType
-    };
-  }
-
-  if (ref.startsWith("data:")) {
-    return imageFromDataUrl(ref);
-  }
-
-  return {
-    bytes: base64ToBytes(ref),
-    contentType: "image/png"
-  };
-}
-
-function imageFromDataUrl(value: string): NormalizedImage {
-  const match = value.match(/^data:([^;,]+)?;base64,(.+)$/);
-  if (!match) {
-    throw new HttpError(400, "invalid_data_url_image");
-  }
-
-  return {
-    bytes: base64ToBytes(match[2]),
-    contentType: normalizeImageContentType(match[1] ?? "image/png")
-  };
-}
-
 async function storeImages(task: ImageTaskRow, images: NormalizedImage[], env: Env): Promise<StoredImageObject[]> {
   const stored: StoredImageObject[] = [];
 
@@ -2182,15 +2104,6 @@ function compareBytes(left: Uint8Array, right: Uint8Array): number {
   return left.length - right.length;
 }
 
-function json(body: unknown, status = 200): Response {
-  return withCors(
-    new Response(JSON.stringify(body), {
-      status,
-      headers: JSON_HEADERS
-    })
-  );
-}
-
 function accountAdminPage(): Response {
   const html = String.raw`<!doctype html>
 <html lang="zh-CN">
@@ -2387,98 +2300,6 @@ function accountAdminPage(): Response {
   );
 }
 
-function withCors(response: Response): Response {
-  const headers = new Headers(response.headers);
-  headers.set("Access-Control-Allow-Origin", "*");
-  headers.set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
-  headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers
-  });
-}
-
-function parseBoundedInteger(value: string | null | undefined, fallback: number, min: number, max: number): number {
-  if (value === null || value === undefined || value === "") return fallback;
-  const parsed = Number(value);
-  if (!Number.isInteger(parsed)) return fallback;
-  return Math.min(Math.max(parsed, min), max);
-}
-
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort("timeout"), timeoutMs);
-  try {
-    return await fetch(url, {
-      ...init,
-      signal: controller.signal
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function ensureOk(response: Response, context: string): Promise<void> {
-  if (response.ok) return;
-  const body = await response.text();
-  throw new Error(`upstream_http_error:${context}:${response.status}:${truncate(body, 1000)}`);
-}
-
-function looksLikeImageReference(value: string): boolean {
-  return (
-    value.startsWith("http://") ||
-    value.startsWith("https://") ||
-    value.startsWith("data:image/") ||
-    looksLikeBase64Image(value)
-  );
-}
-
-function looksLikeBase64Image(value: string): boolean {
-  const compact = value.replace(/\s/g, "");
-  if (compact.length < 64 || !/^[A-Za-z0-9+/]+={0,2}$/.test(compact)) {
-    return false;
-  }
-
-  return compact.startsWith("iVBORw0KGgo") || compact.startsWith("/9j/") || compact.startsWith("UklGR");
-}
-
-function base64ToBytes(value: string): Uint8Array {
-  const binary = atob(value.replace(/\s/g, ""));
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
-function bytesToBase64(value: Uint8Array): string {
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let offset = 0; offset < value.length; offset += chunkSize) {
-    binary += String.fromCharCode(...value.slice(offset, offset + chunkSize));
-  }
-  return btoa(binary);
-}
-
-function normalizeImageContentType(value: string): string {
-  const contentType = value.split(";")[0].trim().toLowerCase();
-  if (contentType === "image/jpeg" || contentType === "image/png" || contentType === "image/webp") {
-    return contentType;
-  }
-  return "image/png";
-}
-
-function extensionForContentType(contentType: string): string {
-  if (contentType === "image/jpeg") return "jpg";
-  if (contentType === "image/webp") return "webp";
-  return "png";
-}
-
 function keyHint(apiKey: string): string {
   return apiKey.length <= 8 ? "***" : `***${apiKey.slice(-4)}`;
 }
@@ -2495,25 +2316,4 @@ function logTaskEvent(event: string, details: Record<string, unknown>): void {
       ...details
     })
   );
-}
-
-function truncate(value: string, maxLength: number): string {
-  return value.length <= maxLength ? value : `${value.slice(0, maxLength)}...`;
-}
-
-function byteLength(value: string): number {
-  return new TextEncoder().encode(value).byteLength;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-class HttpError extends Error {
-  constructor(
-    public readonly status: number,
-    message: string
-  ) {
-    super(message);
-  }
 }

@@ -92,6 +92,8 @@ npm run deploy
 - `src/index.ts`: Worker entrypoint, routing, task lifecycle, queue consumer, upstream adapters, and serializers.
 - `src/types.ts`: Worker bindings, request/row/domain types shared across modules and tests.
 - `src/auth.ts`: Clerk bearer-token verification and task auth context extraction.
+- `src/core.ts`: shared Worker response, CORS, timeout, parsing, and error helpers.
+- `src/image-codecs.ts`: image response parsing, reference extraction, base64/data URL decoding, and content-type helpers.
 - `test/image-response.test.ts`: contract tests for task auth, source selection, image parsing, queue processing, and account APIs.
 - `migrations/`: append-only D1 schema migrations.
 - `docs/deploy-and-development.md`: operational setup, deploy, and troubleshooting guide.
