@@ -89,11 +89,14 @@ npm run deploy
 
 ## Project Structure
 
-- `src/index.ts`: Worker entrypoint, routing, task lifecycle, queue consumer, upstream adapters, and serializers.
+- `src/index.ts`: Worker entrypoint, routing, task lifecycle, queue consumer, upstream adapters, serializers, and storage orchestration.
 - `src/types.ts`: Worker bindings, request/row/domain types shared across modules and tests.
 - `src/auth.ts`: Clerk bearer-token verification and task auth context extraction.
 - `src/core.ts`: shared Worker response, CORS, timeout, parsing, and error helpers.
 - `src/image-codecs.ts`: image response parsing, reference extraction, base64/data URL decoding, and content-type helpers.
+- `src/input-validation.ts`: request JSON parsing and reusable primitive field validation helpers.
+- `src/json-utils.ts`: defensive parsing for persisted JSON fields and stored image object metadata.
+- `src/task-normalizer.ts`: create-task source selection, payload normalization, input image validation, and owner binding.
 - `test/image-response.test.ts`: contract tests for task auth, source selection, image parsing, queue processing, and account APIs.
 - `migrations/`: append-only D1 schema migrations.
 - `docs/deploy-and-development.md`: operational setup, deploy, and troubleshooting guide.

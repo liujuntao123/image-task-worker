@@ -16,11 +16,13 @@ import {
   base64ToBytes,
   bytesToBase64,
   extensionForContentType,
-  imageFromDataUrl,
   imageFromReference,
   normalizeImageContentType,
   parseImageApiResponse
 } from "./image-codecs";
+import { optionalNullableInteger, optionalStringField, readJson, stringField } from "./input-validation";
+import { parseJsonArray, parseJsonObject, parseStoredInputImageObject, parseStoredInputImageObjects } from "./json-utils";
+import { CHATGPT_WEB_SOURCE, stringifyTargetPayload, validateCreateTask } from "./task-normalizer";
 import type {
   AccountPoolListResult,
   AccountPoolWriteRequest,
@@ -33,7 +35,6 @@ import type {
   ImageTaskMessage,
   ImageTaskRow,
   ImageTaskSource,
-  NormalizedCreateTaskRequest,
   NormalizedImage,
   NormalizedInputImage,
   StoredImageObject,
@@ -42,11 +43,7 @@ import type {
 export type { Env } from "./types";
 export { extractImageReferences, parseImageApiResponse } from "./image-codecs";
 
-const MAX_TARGET_PAYLOAD_BYTES = 256 * 1024;
-const MAX_INPUT_IMAGES = 16;
-const MAX_INPUT_IMAGE_BYTES = 50 * 1024 * 1024;
 const ACCOUNT_POOL_PAGE_SIZE_MAX = 100;
-const CHATGPT_WEB_SOURCE = "chatgpt-web";
 const CHATGPT_DEFAULT_BASE_URL = "https://chatgpt.com";
 const CHATGPT_DEFAULT_CLIENT_VERSION = "prod-a194cd50d4416d3c0b47c740f206b12ce60f5887";
 const CHATGPT_DEFAULT_CLIENT_BUILD_NUMBER = "6708908";
@@ -1474,76 +1471,6 @@ async function selectTask(taskId: string, env: Env): Promise<ImageTaskRow | null
   return env.DB.prepare("SELECT * FROM image_tasks WHERE id = ?").bind(taskId).first<ImageTaskRow>();
 }
 
-function validateCreateTask(input: CreateTaskRequest, env: Env, auth: AuthContext): NormalizedCreateTaskRequest {
-  const source = normalizeTaskSource(env.IMAGE_TASK_SOURCE ?? input.source);
-  const targetUrl =
-    source === "chatgpt-web"
-      ? chatGptBaseUrl(env)
-      : stringField(env.IMAGE_API_URL, "image_api_url", 2048);
-  const apiKey =
-    source === "chatgpt-web"
-      ? null
-      : stringField(env.IMAGE_API_KEY, "image_api_key", 4096);
-  const accountId = source === "chatgpt-web" ? optionalStringField(input.accountId, 128) ?? null : null;
-  const explicitPayload = normalizeTargetPayload(input.payload);
-  const inputImages = normalizeInputImages(input.inputImages);
-  const mask = normalizeMaskImage(input.mask);
-  if (mask && inputImages.length === 0) {
-    throw new HttpError(400, "mask_requires_input_image");
-  }
-  const modelId =
-    optionalStringField(env.IMAGE_API_MODEL, 256) ??
-    (source === "chatgpt-web" ? optionalStringField(input.modelId ?? input.modelid, 256) : undefined) ??
-    optionalStringField(explicitPayload?.model, 256) ??
-    (explicitPayload ? "gpt-image-2" : stringField(undefined, "modelid", 256));
-  const prompt =
-    optionalStringField(input.prompt, 20000) ??
-    optionalStringField(explicitPayload?.prompt, 20000) ??
-    (explicitPayload ? "" : stringField(undefined, "prompt", 20000));
-  const targetPayload = stringifyTargetPayload({
-    ...(explicitPayload ?? {}),
-    model: modelId,
-    prompt
-  });
-  const uuid = auth.userId;
-  const maxAttempts = parseBoundedInteger(
-    input.maxAttempts === undefined ? env.MAX_ATTEMPTS : String(input.maxAttempts),
-    3,
-    1,
-    10
-  );
-
-  try {
-    const parsed = new URL(targetUrl);
-    if (parsed.protocol !== "https:" && (source !== "target-api" || parsed.protocol !== "http:")) {
-      throw new Error("invalid protocol");
-    }
-  } catch {
-    throw new HttpError(400, "invalid_target_url");
-  }
-
-  return {
-    targetUrl,
-    apiKey,
-    accountId,
-    modelId,
-    prompt,
-    targetPayload,
-    inputImages,
-    mask,
-    uuid,
-    maxAttempts,
-    source
-  };
-}
-
-function normalizeTaskSource(value: unknown): ImageTaskSource {
-  const raw = optionalStringField(value, 64);
-  if (!raw || raw === "target-api" || raw === "openai-compatible") return "target-api";
-  if (raw === CHATGPT_WEB_SOURCE || raw === "chatgpt" || raw === "chatgpt-web-image") return "chatgpt-web";
-  throw new HttpError(400, "invalid_source");
-}
-
 function normalizeAccountStatus(value: unknown, allowUndefined: boolean): ChatGptAccountStatus | undefined {
   const raw = optionalStringField(value, 64);
   if (!raw) {
@@ -1567,116 +1494,6 @@ function accountStatusForError(error: string): ChatGptAccountStatus {
     return "invalid";
   }
   return "invalid";
-}
-
-function normalizeTargetPayload(value: unknown): Record<string, unknown> | null {
-  if (value === undefined || value === null) {
-    return null;
-  }
-
-  if (typeof value !== "object" || Array.isArray(value)) {
-    throw new HttpError(400, "payload_object_required");
-  }
-
-  return value as Record<string, unknown>;
-}
-
-function normalizeInputImages(value: unknown): NormalizedInputImage[] {
-  if (value === undefined || value === null) return [];
-  if (!Array.isArray(value)) {
-    throw new HttpError(400, "input_images_array_required");
-  }
-  if (value.length > MAX_INPUT_IMAGES) {
-    throw new HttpError(400, "too_many_input_images");
-  }
-
-  return value.map((item, index) => normalizeInputImage(item, index));
-}
-
-function normalizeInputImage(value: unknown, index: number): NormalizedInputImage {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new HttpError(400, "input_image_object_required");
-  }
-
-  const record = value as Record<string, unknown>;
-  const dataUrl = stringField(record.dataUrl, "input_image_data_url", MAX_INPUT_IMAGE_BYTES * 2);
-  const image = imageFromDataUrl(dataUrl);
-  if (image.bytes.byteLength > MAX_INPUT_IMAGE_BYTES) {
-    throw new HttpError(400, "input_image_too_large");
-  }
-
-  const fallbackName = `input-${index + 1}.${extensionForContentType(image.contentType)}`;
-  return {
-    ...image,
-    filename: optionalStringField(record.filename, 160) ?? fallbackName
-  };
-}
-
-function normalizeMaskImage(value: unknown): NormalizedInputImage | null {
-  if (value === undefined || value === null) return null;
-  const image = normalizeInputImage(value, 0);
-  if (image.contentType !== "image/png") {
-    throw new HttpError(400, "mask_png_required");
-  }
-  return {
-    ...image,
-    filename: "mask.png"
-  };
-}
-
-function stringifyTargetPayload(payload: Record<string, unknown>): string {
-  const jsonPayload = JSON.stringify(payload);
-  if (byteLength(jsonPayload) > MAX_TARGET_PAYLOAD_BYTES) {
-    throw new HttpError(400, "payload_too_large");
-  }
-  return jsonPayload;
-}
-
-function stringField(value: unknown, name: string, maxLength: number): string {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw new HttpError(400, `${name}_required`);
-  }
-
-  const trimmed = value.trim();
-  if (trimmed.length > maxLength) {
-    throw new HttpError(400, `${name}_too_long`);
-  }
-
-  return trimmed;
-}
-
-function optionalStringField(value: unknown, maxLength: number): string | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-
-  if (trimmed.length > maxLength) {
-    throw new HttpError(400, "field_too_long");
-  }
-
-  return trimmed;
-}
-
-function optionalNullableInteger(value: unknown, min: number, max: number): number | null {
-  if (value === undefined || value === null || value === "") return null;
-  const parsed = typeof value === "number" ? value : Number(value);
-  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
-    throw new HttpError(400, "invalid_integer_field");
-  }
-  return parsed;
-}
-
-async function readJson<T>(request: Request): Promise<T> {
-  try {
-    return (await request.json()) as T;
-  } catch {
-    throw new HttpError(400, "invalid_json");
-  }
 }
 
 function serializeTask(row: ImageTaskRow) {
@@ -1786,46 +1603,6 @@ async function deleteStoredObjectsByTaskPrefix(uuid: string, taskId: string, env
 
 function cleanupModeFor(target: DeletedTaskCleanupTarget): "stored_objects" | "prefix_scan" {
   return target.resultObjects ? "stored_objects" : "prefix_scan";
-}
-
-function parseJsonArray<T>(value: string | null): T[] {
-  if (!value) return [];
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    return Array.isArray(parsed) ? (parsed as T[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-function parseJsonObject(value: string | null): Record<string, unknown> | null {
-  if (!value) return null;
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
-  } catch {
-    return null;
-  }
-}
-
-function parseStoredInputImageObjects(value: unknown): StoredInputImageObject[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((item) => {
-    const object = parseStoredInputImageObject(item);
-    return object ? [object] : [];
-  });
-}
-
-function parseStoredInputImageObject(value: unknown): StoredInputImageObject | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  if (typeof record.key !== "string" || typeof record.contentType !== "string") return null;
-  return {
-    key: record.key,
-    contentType: record.contentType,
-    size: typeof record.size === "number" ? record.size : 0,
-    filename: typeof record.filename === "string" ? record.filename : "input.png"
-  };
 }
 
 function imageTaskSourceFor(task: Pick<ImageTaskRow, "target_payload">): ImageTaskSource {
