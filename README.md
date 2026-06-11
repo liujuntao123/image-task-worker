@@ -93,6 +93,7 @@ npm run deploy
 - `src/types.ts`: Worker bindings, request/row/domain types shared across modules and tests.
 - `src/auth.ts`: Clerk bearer-token verification and task auth context extraction.
 - `src/account-admin-page.ts`: embedded account-pool admin page served by the Worker.
+- `src/chatgpt-web-utils.ts`: ChatGPT Web SSE parsing, generated-image pointer extraction, and proof-of-work helpers.
 - `src/core.ts`: shared Worker response, CORS, timeout, parsing, and error helpers.
 - `src/image-codecs.ts`: image response parsing, reference extraction, base64/data URL decoding, and content-type helpers.
 - `src/input-validation.ts`: request JSON parsing and reusable primitive field validation helpers.
